@@ -16,6 +16,25 @@ This service should be connected to the [Safe Transaction Service](https://githu
 
 ![Events Service Diagram](./docs/img/events.png)
 
+## Endpoints
+
+Available endpoints:
+
+- /health/ -> Check health for the service.
+- /admin/ -> Admin panel to edit database models.
+- /events/sse/{CHECKSUMMED_SAFE_ADDRESS} -> Server side events endpoint. If `SSE_AUTH_TOKEN` is defined then authentication
+  will be enabled and header `Authorization: Basic $SSE_AUTH_TOKEN` must be added to the request.
+
+## How to integrate with the service
+
+If you want to integrate with the events service, you need to:
+- Build a REST API with an endpoint that can receive `json/application` requests (take a look at [Events Supported](#events-supported)).
+- Endpoint need to answer with:
+  - `HTTP 202` status
+  - Nothing in the body.
+  - It should answer **as soon as posible**, as events service will timeout in 5 seconds, if multiple timeouts are detected **service will stop sending requests** to your endpoint. So you should receive the event, return a HTTP response and then act upon it.
+  - Configuring HTTP Basic Auth in your endpoint is recommended so a malicious user cannot post fake events to your service.
+
 ## Events supported
 
 Some parameters are common to every event:
@@ -71,12 +90,12 @@ Some parameters are common to every event:
 }
 ```
 
-### Incoming Ether
+### Incoming/Outgoing Ether
 
 ```json
 {
   "address": "<Ethereum checksummed address>",
-  "type": "INCOMING_ETHER",
+  "type": "INCOMING_ETHER" | "OUTGOING_ETHER",
   "txHash": "<0x-prefixed-hex-string>",
   "value": "<stringified-int>",
   "chainId": "<stringified-int>"
@@ -119,6 +138,48 @@ Some parameters are common to every event:
 "chainId": "<stringified-int>"
 }
 ```
+
+# FAQ
+
+## Do you have a dashboard/status page?
+
+Not currently.
+
+## Do I need to set up this service to receive the events?
+
+No, this event is only meant to be run by companies running the [Safe Transaction Service](https://github.com/safe-global/safe-transaction-service). You need to develop your own endpoint as explained in [How to integrate with the service](#how-to-integrate-with-the-service)
+
+## Can you please share the delivery delay for the webhook?
+
+Indexing can take 1-2 minutes in the worst cases and less than 15 seconds in good cases.
+
+## Will the webhooks do retries?
+
+Currently no, and please count on that maybe due to some network issues you can lose a webhook. We will work on resilience patterns like retrying or removing an integration if service cannot deliver webhooks for some time.
+
+## Do you plan to have a way to trigger a backfill in case our systems go down?
+
+In case our systems go down, messages should be stored in our queue and when the systems are up resending should be restored (unless queue is overflowed because services have been done for a while and some old messages are discarded).
+
+## Is it available on all chains already?
+
+Yes, and we can configure the [chains you want to get events from](https://docs.safe.global/safe-core-api/supported-networks).
+
+## What safes do we get webhooks requests for?
+
+You get webhooks for all Safes, it currently cannot be configured.
+
+## Could you add more information to the webhook so we don’t have to query the transaction service?
+
+No, we would like to keep webhook information minimal. Doing queries afterwards to the service is ok, but we are not planning on doing the webhooks the source of information for the service. The idea for webhooks is to remove the need for polling the services.
+
+## One thing that could be useful is a unique id for the events:
+
+https://github.com/safe-global/safe-events-service/issues/116
+
+## How do you handle confirmed/unconfirmed blocks and reorgs. When do you send an event? After waiting for confirmation or immediately? If a transaction is removed due to a chain reorg, would you still send the event before it is confirmed?
+
+We don't send notifications when a reorg happens. We send the events as soon as we detect them, no waiting for confirmations. So you should always come to the API and make sure the data is what you expect. This events feature is something built for notifying so we prevent people http polling our API, but it shouldn't be taking the events as a source of trust, only as a signal to come back to the API (that's why we don't send a lot of informations in the events).
 
 # Developer documentation
 
@@ -189,12 +250,3 @@ Remember to add the new database entities to `./src/datasources/db/database.opti
 ```bash
 bash ./scripts/db_generate_migrations.sh RELEVANT_MIGRATION_NAME
 ```
-
-## Endpoints
-
-Available endpoints:
-
-- /health/ -> Check health for the service.
-- /admin/ -> Admin panel to edit database models.
-- /events/sse/{CHECKSUMMED_SAFE_ADDRESS} -> Server side events endpoint. If `SSE_AUTH_TOKEN` is defined then authentication
-  will be enabled and header `Authorization: Basic $SSE_AUTH_TOKEN` must be added to the request.
