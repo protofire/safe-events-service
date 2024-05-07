@@ -12,7 +12,6 @@ export class EventsService implements OnApplicationBootstrap {
 
   constructor(
     private readonly queueProvider: QueueProvider,
-
     private readonly webhookService: WebhookService,
   ) {}
 
@@ -69,10 +68,15 @@ export class EventsService implements OnApplicationBootstrap {
   }
 
   processEvent(message: string): Promise<(AxiosResponse | undefined)[]> {
-    this.logger.log(`Processing event ${message}`);
     let txServiceEvent: TxServiceEvent;
     try {
       txServiceEvent = JSON.parse(message);
+      this.logger.log({
+        message: `Processing event`,
+        messageContext: {
+          event: txServiceEvent,
+        },
+      });
     } catch (err) {
       this.logger.error(`Cannot parse message as JSON: ${message}`);
       return Promise.resolve([undefined]);
