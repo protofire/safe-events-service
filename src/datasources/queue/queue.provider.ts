@@ -1,37 +1,61 @@
 import { Injectable, Logger, OnApplicationShutdown } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { IAmqpConnectionManager } from 'amqp-connection-manager/dist/esm/AmqpConnectionManager';
 import { Channel, ConsumeMessage } from 'amqplib';
-import amqp, { ChannelWrapper } from 'amqp-connection-manager';
+import amqp, {
+  ChannelWrapper,
+  AmqpConnectionManager,
+} from 'amqp-connection-manager';
+
+export type QueueConnection = {
+  connection: AmqpConnectionManager;
+  channel: ChannelWrapper;
+};
 
 @Injectable()
 export class QueueProvider implements OnApplicationShutdown {
   private readonly logger = new Logger(QueueProvider.name);
-  private connection: IAmqpConnectionManager | undefined;
+  private connection: AmqpConnectionManager | undefined;
   private channelWrapper: ChannelWrapper | undefined;
 
   constructor(private readonly configService: ConfigService) {}
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   onApplicationShutdown(signal?: string) {
-    // Not enabled by default
-    // https://docs.nestjs.com/fundamentals/lifecycle-events#application-shutdown
+    // Not enabled by default https://docs.nestjs.com/fundamentals/lifecycle-events#application-shutdown
     return this.disconnect();
   }
 
+  /**
+   *
+   * @returns AMQP Url
+   */
   getAmqpUrl(): string {
-    return this.configService.getOrThrow('AMQP_URL');
+    const value = this.configService.getOrThrow('AMQP_URL');
+    this.logger.log(`AMQP_URL=${value}`);
+    return value;
   }
 
+  /**
+   *
+   * @returns AMQP Queue Name to consum from, if it doesn't exist it will be created
+   */
   getQueueName(): string {
-    return this.configService.get('AMQP_QUEUE') ?? 'safe-events-service';
+    const value = this.configService.get('AMQP_QUEUE', 'safe-events-service');
+    this.logger.log(`AMQP_QUEUE=${value}`);
+    return value;
   }
 
+  /**
+   *
+   * @returns AMQP Exchange Name to bind the queue to
+   */
   getExchangeName(): string {
-    return (
-      this.configService.get('AMQP_EXCHANGE') ??
-      'safe-transaction-service-events'
+    const value = this.configService.get(
+      'AMQP_EXCHANGE',
+      'safe-transaction-service-events',
     );
+    this.logger.log(`AMQP_EXCHANGE=${value}`);
+    return value;
   }
 
   /**
@@ -40,10 +64,12 @@ export class QueueProvider implements OnApplicationShutdown {
    *          at the same time
    */
   getPrefetchMessages(): number {
-    return this.configService.get('AMQP_PREFETCH_MESSAGES') ?? 10;
+    const value = Number(this.configService.get('AMQP_PREFETCH_MESSAGES', 10));
+    this.logger.log(`AMQP_PREFETCH_MESSAGES=${value}`);
+    return value;
   }
 
-  async getConnection() {
+  async getConnection(): Promise<QueueConnection> {
     if (
       !this.connection ||
       !this.connection.isConnected() ||
@@ -58,7 +84,7 @@ export class QueueProvider implements OnApplicationShutdown {
     };
   }
 
-  async connect() {
+  async connect(): Promise<QueueConnection> {
     this.logger.debug(
       'Connecting to RabbitMQ and creating exchange/queue if not created',
     );
@@ -124,10 +150,13 @@ export class QueueProvider implements OnApplicationShutdown {
       const consumer = await channel.consume(
         this.getQueueName(),
         (message: ConsumeMessage) => {
-          if (message.content) func(message.content.toString());
+          if (message.content) {
+            func(message.content.toString());
+            channel.ack(message);
+          }
         },
         {
-          noAck: true,
+          noAck: false,
         },
       );
       this.logger.debug(

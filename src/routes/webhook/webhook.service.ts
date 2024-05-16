@@ -24,10 +24,10 @@ export class WebhookService {
 
   /**
    *
-   * @returns webhooks cache ttl from `WEBHOOKS_CACHE_TTL`, if not defined 300_000 ms (5 seconds)
+   * @returns Database configuration cache, if not defined 300_000 ms (5 minutes)
    */
   getWebhooksCacheTTL(): number {
-    return this.configService.get('WEBHOOKS_CACHE_TTL') ?? 300_000;
+    return Number(this.configService.get('WEBHOOKS_CACHE_TTL', 300_000));
   }
 
   findAllActive(): Promise<Webhook[]> {
@@ -69,41 +69,105 @@ export class WebhookService {
     return Promise.all(responses);
   }
 
+  parseResponseData(responseData: any): string {
+    if (typeof responseData === 'string') {
+      return responseData;
+    }
+    let dataStr: string;
+    try {
+      dataStr = JSON.stringify(responseData);
+    } catch (_) {
+      dataStr = 'Cannot parse response data';
+    }
+    return dataStr;
+  }
+
   postWebhook(
     parsedMessage: TxServiceEvent,
     url: string,
     authorization: string,
   ): Promise<AxiosResponse | undefined> {
     const headers = authorization ? { Authorization: authorization } : {};
+    const startTime = Date.now();
     return firstValueFrom(
       this.httpService.post(url, parsedMessage, { headers }).pipe(
         catchError((error: AxiosError) => {
-          const strMessage = JSON.stringify(parsedMessage);
           if (error.response !== undefined) {
             // Response received status code but status code not 2xx
-            let dataStr: string;
-            try {
-              dataStr = JSON.stringify(error.response.data);
-            } catch (_) {
-              dataStr = 'Cannot parse response data';
-            }
-            this.logger.error(
-              `Error sending event ${strMessage} to ${url}: ${error.response.status} ${error.response.statusText} - ${dataStr}`,
-            );
+            const responseData = this.parseResponseData(error.response.data);
+            this.logger.error({
+              message: 'Error sending event',
+              messageContext: {
+                event: parsedMessage,
+                httpRequest: {
+                  url: url,
+                  startTime: startTime,
+                },
+                httpResponse: {
+                  data: responseData,
+                  statusCode: error.response.status,
+                },
+              },
+            });
           } else if (error.request !== undefined) {
             // Request was made but response was not received
-            this.logger.error(
-              `Error sending event ${strMessage} to ${url}: Response not received. Error: ${error.message}`,
-            );
+            this.logger.error({
+              message: 'Error sending event',
+              messageContext: {
+                event: parsedMessage,
+                httpRequest: {
+                  url: url,
+                  startTime: startTime,
+                },
+                httpResponse: null,
+                httpRequestError: {
+                  message: `Response not received. Error: ${error.message}`,
+                },
+              },
+            });
           } else {
             // Cannot make request
-            this.logger.error(
-              `Error sending event ${strMessage} to ${url}: ${error.message}`,
-            );
+            this.logger.error({
+              message: 'Error sending event',
+              messageContext: {
+                event: parsedMessage,
+                httpRequest: {
+                  url: url,
+                  startTime: startTime,
+                },
+                httpResponse: null,
+                httpRequestError: {
+                  message: error.message,
+                },
+              },
+            });
           }
           return of(undefined);
         }),
       ),
-    );
+    ).then((response: AxiosResponse | undefined) => {
+      if (response) {
+        const endTime = Date.now();
+        const elapsedTime = endTime - startTime;
+        const responseData = this.parseResponseData(response.data);
+        this.logger.debug({
+          message: 'Success sending event',
+          messageContext: {
+            event: parsedMessage,
+            httpRequest: {
+              url: url,
+              startTime: startTime,
+              endTime: endTime,
+            },
+            httpResponse: {
+              data: responseData,
+              statusCode: response.status,
+              elapsedTimeMs: elapsedTime,
+            },
+          },
+        });
+      }
+      return response;
+    });
   }
 }
