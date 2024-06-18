@@ -1,7 +1,7 @@
 [![CI](https://github.com/safe-global/safe-events-service/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/safe-global/safe-events-service/actions/workflows/ci.yml)
 [![Coverage Status](https://coveralls.io/repos/github/safe-global/safe-events-service/badge.svg?branch=main)](https://coveralls.io/github/safe-global/safe-events-service?branch=main)
 ![Docker Image Version (latest by date)](https://img.shields.io/docker/v/safeglobal/safe-events-service?sort=date)
-![Node required Version](https://img.shields.io/badge/node-%3E%3D18-green)
+![Node required Version](https://img.shields.io/badge/node.js-v20-green)
 
 # User documentation
 
@@ -32,7 +32,7 @@ If you want to integrate with the events service, you need to:
 - Endpoint need to answer with:
   - `HTTP 202` status
   - Nothing in the body.
-  - It should answer **as soon as posible**, as events service will timeout in 5 seconds, if multiple timeouts are detected **service will stop sending requests** to your endpoint. So you should receive the event, return a HTTP response and then act upon it.
+  - It should answer **as soon as posible**, as events service will timeout in 2 seconds, if multiple timeouts are detected **service will stop sending requests** to your endpoint. So you should receive the event, return a HTTP response and then act upon it.
   - Configuring HTTP Basic Auth in your endpoint is recommended so a malicious user cannot post fake events to your service.
 
 ## Events supported
@@ -62,7 +62,7 @@ Some parameters are common to every event:
   "address": "<Ethereum checksummed address>",
   "type": "EXECUTED_MULTISIG_TRANSACTION",
   "safeTxHash": "<0x-prefixed-hex-string>",
-  "failed": <bool>,
+  "failed": "true" | "false",
   "txHash": "<0x-prefixed-hex-string>",
   "chainId": "<stringified-int>"
 }
