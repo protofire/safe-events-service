@@ -139,6 +139,30 @@ Some parameters are common to every event:
 }
 ```
 
+### Reorg detected
+
+```json
+{
+"type": "REORG_DETECTED",
+"blockNumber": "<int>",
+"chainId": "<stringified-int>"
+}
+```
+
+### Delegates add/update/delete
+
+```json
+{
+"address": "<Ethereum checksummed address>" | null,
+"type": "NEW_DELEGATE" | "UPDATED_DELEGATE" | "DELETED_DELEGATE",
+"delegate": "<Ethereum checksummed address>",
+"delegator": "<Ethereum checksummed address>",
+"label": "<string>",
+"expiryDateSeconds": "<int>" | null,
+"chainId": "<stringified-int>"
+}
+```
+
 # FAQ
 
 ## Do you have a dashboard/status page?
