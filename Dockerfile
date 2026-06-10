@@ -1,31 +1,41 @@
 #
 # BUILD CONTAINER
 #
-FROM node:22 AS base
+FROM node:24 AS base
+RUN corepack enable
 USER node
 WORKDIR /app
-COPY --chown=node:node package*.json tsconfig*.json ./
+COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig*.json ./
 
-#FIXME Remove this after https://github.com/npm/cli/issues/4828 is closed
-RUN rm package-lock.json
+# Install dependencies
+RUN pnpm install --frozen-lockfile --ignore-scripts
 
-# Fix arm64 timeouts
-RUN npm install --fetch-timeout 3600000 --maxsockets 1
+# Copy source code
 COPY --chown=node:node . .
-ENV NODE_ENV production
-RUN npm run build
+
+# Build application
+ENV NODE_ENV=production
+RUN pnpm run build
+
+# Clean and reinstall only production dependencies
+ENV CI=true
+RUN pnpm prune --prod --ignore-scripts
 
 #
 # PRODUCTION CONTAINER
 #
-ENV NODE_ENV production
-FROM node:22 AS production
+FROM node:24 AS production
+ENV NODE_ENV=production
 USER node
 EXPOSE 3000
 WORKDIR /app
+
+# Copy built application and production node_modules from base stage
+
 COPY --chown=node:node --from=base /app/node_modules ./node_modules
 COPY --chown=node:node --from=base /app/dist ./dist
 COPY --chown=node:node --from=base /app/scripts ./scripts
 COPY --chown=node:node --from=base /app/package.json ./
-# CMD [ "node", "dist/main.js" ]
+
+# Start the application
 CMD [ "/bin/bash", "./scripts/docker_run.sh" ]

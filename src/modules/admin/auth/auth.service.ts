@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { safeCompare } from '../../../common/utils/safe-compare';
 
 @Injectable()
 export class AuthService {
@@ -20,10 +21,14 @@ export class AuthService {
     const email = this.getAdminEmail();
     const password = this.getAdminPassword();
     const adminCredentials = { email, password };
-    if (
-      providedEmail === adminCredentials.email &&
-      providedPassword === adminCredentials.password
-    ) {
+    // Compute both comparisons before combining them so the check does not
+    // short-circuit and leak (via timing) whether the email was correct.
+    const emailMatch = safeCompare(providedEmail, adminCredentials.email);
+    const passwordMatch = safeCompare(
+      providedPassword,
+      adminCredentials.password,
+    );
+    if (emailMatch && passwordMatch) {
       return adminCredentials;
     }
     return undefined;

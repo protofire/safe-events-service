@@ -1,31 +1,54 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { Cache } from 'cache-manager';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Webhook, WebhookWithStats } from './repositories/webhook.entity';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { ConfigService } from '@nestjs/config';
-import { HttpService } from '@nestjs/axios';
-import { of, catchError, firstValueFrom } from 'rxjs';
-import { AxiosError, AxiosResponse } from 'axios';
+import { Dispatcher } from 'undici';
 import { TxServiceEvent } from '../events/event.dto';
 import { WebhookService } from './webhook.service';
 import { Cron } from '@nestjs/schedule';
 
+export const UNDICI_AGENT = Symbol('UNDICI_AGENT');
+
+const JSON_CONTENT_TYPE = 'application/json';
+
+// Cap how much of a webhook response body we read into memory before logging.
+// A misbehaving or malicious target could otherwise stream an unbounded body.
+const DEFAULT_MAX_RESPONSE_BYTES = 10_000;
+
+type ResponseBody = Dispatcher.ResponseData['body'];
+
+const NO_RESPONSE_CODES = new Set([
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+  'UND_ERR_SOCKET',
+  'ECONNRESET',
+  'ETIMEDOUT',
+]);
+
+export interface WebhookResponse {
+  statusCode: number;
+  data: string;
+}
+
 @Injectable()
-export class WebhookDispatcherService {
+export class WebhookDispatcherService implements OnModuleDestroy {
   private readonly logger = new Logger(WebhookDispatcherService.name);
   private webhookMap: Map<string, WebhookWithStats> = new Map();
   private webhookFailureThreshold: number;
   private webhookHealthMinutesWindow: number;
   private autoDisableWebhook: boolean;
+  private webhookMaxResponseBytes: number;
 
   constructor(
     @InjectRepository(Webhook)
-    private readonly WebHooksRepository: Repository<Webhook>,
+    private readonly webhooksRepository: Repository<Webhook>,
     @Inject(CACHE_MANAGER) private readonly cacheManager: Cache,
     private readonly configService: ConfigService,
-    private readonly httpService: HttpService,
+    @Inject(UNDICI_AGENT) private readonly agent: Dispatcher,
     private readonly webhookService: WebhookService,
   ) {
     this.webhookFailureThreshold = this.configService.get<number>(
@@ -39,6 +62,12 @@ export class WebhookDispatcherService {
     // Disabled by default
     this.autoDisableWebhook =
       this.configService.get('WEBHOOK_AUTO_DISABLE') === 'true';
+    this.webhookMaxResponseBytes = Number(
+      this.configService.get(
+        'WEBHOOK_MAX_RESPONSE_BYTES',
+        DEFAULT_MAX_RESPONSE_BYTES,
+      ),
+    );
   }
 
   /**
@@ -51,11 +80,15 @@ export class WebhookDispatcherService {
     await this.refreshWebhookMap();
   }
 
+  async onModuleDestroy() {
+    await this.agent.close();
+  }
+
   /**
    * @returns Return active webhooks from database
    */
   getAllActive(): Promise<Webhook[]> {
-    return this.WebHooksRepository.findBy({ isActive: true });
+    return this.webhooksRepository.findBy({ isActive: true });
   }
 
   /**
@@ -65,7 +98,7 @@ export class WebhookDispatcherService {
    */
   async disableWebhook(id: string): Promise<boolean> {
     try {
-      const result = await this.WebHooksRepository.update(
+      const result = await this.webhooksRepository.update(
         { id },
         { isActive: false },
       );
@@ -93,21 +126,85 @@ export class WebhookDispatcherService {
     return Array.from(this.webhookMap.values());
   }
 
+  /**
+   * @returns an iterator over the in-memory stored webhooks, avoiding the array
+   * allocation of {@link getCachedActiveWebhooks} on the hot dispatch path.
+   */
+  getCachedActiveWebhooksIterator(): IterableIterator<WebhookWithStats> {
+    return this.webhookMap.values();
+  }
+
   async postEveryWebhook(
     parsedMessage: TxServiceEvent,
-  ): Promise<(AxiosResponse | undefined)[]> {
-    const webhooks: WebhookWithStats[] = this.getCachedActiveWebhooks();
-    const responses: Promise<AxiosResponse | undefined>[] = webhooks
-      .filter((webhook: WebhookWithStats) => {
-        return webhook.isEventRelevant(parsedMessage);
-      })
-      .map((webhook: WebhookWithStats) => {
-        this.logger.debug(
-          `Sending ${JSON.stringify(parsedMessage)} to ${webhook.url}`,
-        );
-        return this.postWebhook(parsedMessage, webhook);
-      });
+  ): Promise<(WebhookResponse | undefined)[]> {
+    // Iterate the cached webhooks lazily instead of materializing them into an
+    // array (and then filtering/mapping it) on every incoming event.
+    const responses: Promise<WebhookResponse | undefined>[] = [];
+    for (const webhook of this.getCachedActiveWebhooksIterator()) {
+      if (!webhook.isEventRelevant(parsedMessage)) {
+        continue;
+      }
+      this.logger.debug(
+        `Sending ${JSON.stringify(parsedMessage)} to ${webhook.url}`,
+      );
+      responses.push(this.postWebhook(parsedMessage, webhook));
+    }
     return Promise.all(responses);
+  }
+
+  private logSendError(
+    parsedMessage: TxServiceEvent,
+    webhook: WebhookWithStats,
+    startTime: number,
+    deliveryId: string,
+    httpResponse: { data: string; statusCode: number } | null,
+    error?: Error & { code?: string },
+  ): void {
+    const httpRequestError = error
+      ? {
+          message:
+            error.code != null && NO_RESPONSE_CODES.has(error.code)
+              ? `Response not received. Error: ${error.message}`
+              : error.message,
+        }
+      : undefined;
+
+    this.logger.error({
+      message: 'Error sending event',
+      messageContext: {
+        event: parsedMessage,
+        httpRequest: { url: webhook.url, startTime, deliveryId },
+        httpResponse,
+        ...(httpRequestError ? { httpRequestError } : {}),
+      },
+    });
+  }
+
+  /**
+   * Reads a webhook response body up to `webhookMaxResponseBytes`, discarding
+   * (and flagging) anything beyond the limit so an oversized response cannot
+   * exhaust memory. The body is only used for logging.
+   */
+  async readBodyWithLimit(body: ResponseBody): Promise<string> {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let truncated = false;
+
+    for await (const chunk of body) {
+      chunks.push(chunk as Buffer);
+      total += (chunk as Buffer).length;
+      if (total > this.webhookMaxResponseBytes) {
+        truncated = true;
+        // Breaking destroys the underlying stream and stops consuming.
+        break;
+      }
+    }
+
+    const text = Buffer.concat(chunks)
+      .subarray(0, this.webhookMaxResponseBytes)
+      .toString('utf8');
+
+    return truncated ? `${text}… [truncated]` : text;
   }
 
   parseResponseData(responseData: any): string {
@@ -123,96 +220,117 @@ export class WebhookDispatcherService {
     return dataStr;
   }
 
-  postWebhook(
+  private buildRequestHeaders(
+    webhook: WebhookWithStats,
+    deliveryId: string,
+  ): Record<string, string> {
+    const headers: Record<string, string> = {
+      'content-type': JSON_CONTENT_TYPE,
+      'x-delivery-id': deliveryId,
+    };
+
+    if (webhook.authorization) {
+      headers.authorization = webhook.authorization;
+    }
+
+    return headers;
+  }
+
+  private buildRequestOptions(
     parsedMessage: TxServiceEvent,
     webhook: WebhookWithStats,
-  ): Promise<AxiosResponse | undefined> {
-    const headers = webhook.authorization
-      ? { Authorization: webhook.authorization }
-      : {};
-    const startTime = Date.now();
-    return firstValueFrom(
-      this.httpService.post(webhook.url, parsedMessage, { headers }).pipe(
-        catchError((error: AxiosError) => {
-          webhook.incrementFailure();
-          if (error.response !== undefined) {
-            // Response received status code but status code not 2xx
-            const responseData = this.parseResponseData(error.response.data);
-            this.logger.error({
-              message: 'Error sending event',
-              messageContext: {
-                event: parsedMessage,
-                httpRequest: {
-                  url: webhook.url,
-                  startTime: startTime,
-                },
-                httpResponse: {
-                  data: responseData,
-                  statusCode: error.response.status,
-                },
-              },
-            });
-          } else if (error.request !== undefined) {
-            // Request was made but response was not received
-            this.logger.error({
-              message: 'Error sending event',
-              messageContext: {
-                event: parsedMessage,
-                httpRequest: {
-                  url: webhook.url,
-                  startTime: startTime,
-                },
-                httpResponse: null,
-                httpRequestError: {
-                  message: `Response not received. Error: ${error.message}`,
-                },
-              },
-            });
-          } else {
-            // Cannot make request
-            this.logger.error({
-              message: 'Error sending event',
-              messageContext: {
-                event: parsedMessage,
-                httpRequest: {
-                  url: webhook.url,
-                  startTime: startTime,
-                },
-                httpResponse: null,
-                httpRequestError: {
-                  message: error.message,
-                },
-              },
-            });
-          }
-          return of(undefined);
-        }),
-      ),
-    ).then((response: AxiosResponse | undefined) => {
-      if (response) {
-        webhook.incrementSuccess();
-        const endTime = Date.now();
-        const elapsedTime = endTime - startTime;
-        const responseData = this.parseResponseData(response.data);
-        this.logger.debug({
-          message: 'Success sending event',
-          messageContext: {
-            event: parsedMessage,
-            httpRequest: {
-              url: webhook.url,
-              startTime: startTime,
-              endTime: endTime,
-            },
-            httpResponse: {
-              data: responseData,
-              statusCode: response.status,
-              elapsedTimeMs: elapsedTime,
-            },
-          },
-        });
-      }
-      return response;
+    deliveryId: string,
+  ) {
+    const url = new URL(webhook.url);
+
+    return {
+      origin: url.origin,
+      path: url.pathname + url.search,
+      method: 'POST' as const,
+      headers: this.buildRequestHeaders(webhook, deliveryId),
+      body: JSON.stringify(parsedMessage),
+    };
+  }
+
+  private logSendSuccess(
+    parsedMessage: TxServiceEvent,
+    webhook: WebhookWithStats,
+    startTime: number,
+    deliveryId: string,
+    response: WebhookResponse,
+  ): void {
+    const endTime = Date.now();
+
+    this.logger.debug({
+      message: 'Success sending event',
+      messageContext: {
+        event: parsedMessage,
+        httpRequest: {
+          url: webhook.url,
+          startTime,
+          endTime,
+          deliveryId,
+        },
+        httpResponse: {
+          data: response.data,
+          statusCode: response.statusCode,
+          elapsedTimeMs: endTime - startTime,
+        },
+      },
     });
+  }
+
+  async postWebhook(
+    parsedMessage: TxServiceEvent,
+    webhook: WebhookWithStats,
+  ): Promise<WebhookResponse | undefined> {
+    const startTime = Date.now();
+    const deliveryId = crypto.randomUUID();
+
+    try {
+      const response = await this.agent.request(
+        this.buildRequestOptions(parsedMessage, webhook, deliveryId),
+      );
+      const webhookResponse = {
+        statusCode: response.statusCode,
+        data: this.parseResponseData(
+          await this.readBodyWithLimit(response.body),
+        ),
+      };
+
+      if (
+        webhookResponse.statusCode < 200 ||
+        webhookResponse.statusCode >= 300
+      ) {
+        webhook.incrementFailure();
+        this.logSendError(parsedMessage, webhook, startTime, deliveryId, {
+          data: webhookResponse.data,
+          statusCode: webhookResponse.statusCode,
+        });
+        return undefined;
+      }
+
+      webhook.incrementSuccess();
+      this.logSendSuccess(
+        parsedMessage,
+        webhook,
+        startTime,
+        deliveryId,
+        webhookResponse,
+      );
+      return webhookResponse;
+    } catch (error: any) {
+      webhook.incrementFailure();
+      this.logSendError(
+        parsedMessage,
+        webhook,
+        startTime,
+        deliveryId,
+        null,
+        error,
+      );
+      return undefined;
+    }
   }
 
   /**
@@ -233,16 +351,35 @@ export class WebhookDispatcherService {
             const wasDisabled = await this.disableWebhook(webhook.id);
             if (wasDisabled) {
               this.logger.warn({
-                message: `Webhook disabled — ID: ${webhook.id}, URL: ${webhook.url}, failure rate exceeded threshold.`,
+                message: 'Webhook disabled, failure rate exceeded threshold.',
+                messageContext: {
+                  webhook: {
+                    id: webhook.id,
+                    url: webhook.url,
+                  },
+                },
               });
             } else {
               this.logger.error({
-                message: `Failed to disable webhook — ID: ${webhook.id}, URL: ${webhook.url}.`,
+                message: 'Failed to disable webhook',
+                messageContext: {
+                  webhook: {
+                    id: webhook.id,
+                    url: webhook.url,
+                  },
+                },
               });
             }
           } else {
             this.logger.warn({
-              message: `Webhook exceeded failure threshold but was not disabled (autoDisableWebhook is OFF) — ID: ${webhook.id}, URL: ${webhook.url}.`,
+              message:
+                'Webhook exceeded failure threshold but was not disabled (autoDisableWebhook is OFF)',
+              messageContext: {
+                webhook: {
+                  id: webhook.id,
+                  url: webhook.url,
+                },
+              },
             });
           }
         }
